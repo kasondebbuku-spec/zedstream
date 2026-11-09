@@ -1,4 +1,11 @@
-import { api, state, esc, $, $$, money, compact, fmtDate, toast, modal } from './core.js';
+import { api, state, esc, $, $$, money, compact, fmtDate, fmtPremiere, isUpcoming, toast, modal } from './core.js';
+
+/** ISO time -> value for <input type="datetime-local"> in the admin's own time zone. */
+const toLocalInput = (iso) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 16);
+};
 
 const TABS = [['dashboard', 'Dashboard'], ['movies', 'Movies'], ['payments', 'Payments'], ['users', 'Users']];
 
@@ -69,7 +76,7 @@ async function moviesTab(body) {
         <td>${m.price > 0 ? money(m.price) : '<span class="tag-free">Free</span>'}</td>
         <td>${compact(m.views)}</td><td>${m.rating ? '★ ' + m.rating.toFixed(1) : '–'}</td>
         <td>${m.sales}</td><td>${money(m.revenue)}</td>
-        <td>${m.published ? '<span class="status successful">live</span>' : '<span class="status pending">hidden</span>'}${m.featured ? ' <span class="status pending">featured</span>' : ''}</td>
+        <td>${m.published ? '<span class="status successful">live</span>' : '<span class="status pending">hidden</span>'}${m.featured ? ' <span class="status pending">featured</span>' : ''}${isUpcoming(m) ? ` <span class="status pending">premieres ${esc(fmtPremiere(m.premiereAt))}</span>` : ''}</td>
         <td><button class="btn sm outline" data-edit="${m.id}">Edit</button> <button class="btn sm danger" data-del="${m.id}">Delete</button></td>
       </tr>`).join('')}</tbody>
     </table></div>`;
@@ -77,6 +84,8 @@ async function moviesTab(body) {
     const q = e.target.value.toLowerCase();
     $$('#mRows tr').forEach((r) => r.classList.toggle('hidden', !r.dataset.title.includes(q)));
   };
+  body.insertAdjacentHTML('beforeend', '<div id="passPanel" style="margin-top:22px"></div>');
+  seasonPasses($('#passPanel', body));
   $('#addMovie').onclick = () => movieForm(null, () => moviesTab(body));
   $$('[data-edit]', body).forEach((b) => (b.onclick = () => movieForm(movies.find((m) => m.id === +b.dataset.edit), () => moviesTab(body))));
   $$('[data-del]', body).forEach((b) => (b.onclick = async () => {
@@ -112,6 +121,8 @@ function movieForm(m, done) {
         <span class="hint">${m?.videoFile ? 'A file is uploaded. Choose a new one to replace it. ' : ''}MP4 (H.264/AAC) plays on every phone.</span></div>
       <div class="field full"><label>…or video URL (streamed through this server, never shown to viewers)</label><input name="videoUrl" type="url" value="${v(m?.videoUrl)}" placeholder="https://…/movie.mp4"></div>
       <div class="field full"><label>Trailer URL (free preview, optional)</label><input name="trailerUrl" type="url" value="${v(m?.trailerUrl)}"></div>
+      <div class="field full"><label>Premiere date &amp; time (optional)</label><input name="premiereAt" type="datetime-local" value="${v(toLocalInput(m?.premiereAt))}">
+        <span class="hint">Before this time the movie shows a countdown and can only be pre-ordered. Rentals start counting from the premiere. Leave empty to release now.</span></div>
       <label class="check"><input type="checkbox" name="featured" ${m?.featured ? 'checked' : ''}> Feature on home banner</label>
       <label class="check"><input type="checkbox" name="published" ${m ? (m.published ? 'checked' : '') : 'checked'}> Published</label>
       ${m?.videoFile ? '<label class="check full"><input type="checkbox" name="removeVideo"> Remove uploaded video file</label>' : ''}
@@ -126,6 +137,7 @@ function movieForm(m, done) {
     const fd = new FormData(e.target);
     fd.set('featured', f.featured.checked ? '1' : '0');
     fd.set('published', f.published.checked ? '1' : '0');
+    fd.set('premiereAt', f.premiereAt.value ? new Date(f.premiereAt.value).toISOString() : '');
     if (f.removeVideo) fd.set('removeVideo', f.removeVideo.checked ? '1' : '0');
     for (const k of ['poster', 'backdrop', 'video']) if (!f[k].files.length) fd.delete(k);
     // XHR instead of fetch so we can show upload progress for big video files.
@@ -211,5 +223,39 @@ async function usersTab(body) {
   $$('[data-role]', body).forEach((s) => (s.onchange = async () => {
     await api(`/admin/users/${s.dataset.role}/role`, { method: 'PUT', body: { role: s.value } });
     toast('Role updated', 'ok');
+  }));
+}
+
+// ---------------- Season passes ----------------
+async function seasonPasses(panel) {
+  const { series } = await api('/admin/series');
+  if (!series.length) {
+    panel.innerHTML = '<div class="panel"><h3 style="margin:0 0 6px">Season passes</h3><p class="muted" style="margin:0">Give episodes a series name to sell a season pass for them.</p></div>';
+    return;
+  }
+  panel.innerHTML = `<div class="panel">
+    <h3 style="margin:0 0 4px">Season passes</h3>
+    <p class="muted" style="margin:0 0 12px">One payment unlocks every episode of a series, including episodes you add later.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Series</th><th>Episodes</th><th>Bought one by one</th><th>Pass price (K)</th><th>Access</th><th>On sale</th><th>Sales</th><th></th></tr></thead>
+      <tbody>${series.map((s, i) => `<tr>
+        <td><b>${esc(s.series)}</b></td><td>${s.episodes}</td><td>${money(s.fullPrice)}</td>
+        <td><input class="input" name="price" type="number" min="1" step="0.5" value="${s.pass?.price ?? ''}" placeholder="e.g. ${Math.max(5, Math.round(s.fullPrice * 0.7))}" style="width:110px;height:34px"></td>
+        <td><select class="input" name="days" style="height:34px;width:120px">${[[0, 'Lifetime'], [7, '7 days'], [30, '30 days'], [90, '90 days']].map(([d, l]) => `<option value="${d}" ${(s.pass?.accessDays ?? 0) === d ? 'selected' : ''}>${l}</option>`).join('')}</select></td>
+        <td><input type="checkbox" name="active" ${!s.pass || s.pass.active ? 'checked' : ''} style="width:18px;height:18px;accent-color:var(--accent)"></td>
+        <td>${s.sales} · ${money(s.revenue)}</td>
+        <td><button class="btn sm primary" data-save="${i}">${s.pass ? 'Save' : 'Start selling'}</button></td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+  $$('[data-save]', panel).forEach((b) => (b.onclick = async () => {
+    const row = b.closest('tr');
+    const s = series[+b.dataset.save];
+    try {
+      await api('/admin/series-pass', { method: 'PUT', body: {
+        series: s.series, price: $('[name=price]', row).value, accessDays: $('[name=days]', row).value, active: $('[name=active]', row).checked,
+      } });
+      toast(`Season pass saved for ${s.series}`, 'ok');
+      seasonPasses(panel);
+    } catch (e) { toast(e.message, 'bad'); }
   }));
 }

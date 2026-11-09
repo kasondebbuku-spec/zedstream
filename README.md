@@ -9,6 +9,9 @@ A movie streaming platform where viewers pay per title with **mobile money** (MT
 - Series and episodes with "next episode" at the end
 - **Pay-per-view with mobile money**: enter your number → approve the PIN prompt on your phone → the movie unlocks automatically
 - Rentals (1, 2, 3, 7 or 30 days) or lifetime access, set per title
+- **Premieres with pre-orders**: set a premiere date and time; the title shows a live countdown, fans pay in advance, and it unlocks for everyone at the premiere. Rentals start counting from the premiere. Admins can preview early
+- **Season passes**: one payment unlocks every episode of a series, including episodes added later. Set the price per series in Admin → Movies
+- **Anti-piracy watermark**: paid videos show the viewer's phone number and account ID, moving around the picture, so a screen recording can be traced to the account. Fullscreen keeps the watermark on top; picture-in-picture is turned off for paid titles
 - Protected streaming: video files and video URLs are never exposed to the browser and stream only to users who have paid
 - Continue watching (resume where you left off), My List, purchase and payment history
 - Admin panel: revenue dashboard, movie uploads with progress bar, payment log with "re-check with Lipila", users, granting free access
@@ -55,3 +58,9 @@ Lipila's endpoint paths above come from their public docs and community SDKs. Ch
 - Host behind HTTPS (Railway, Render, a VPS with Caddy or Nginx). Keep the `data/`, `uploads/` and `storage/` folders on a persistent disk
 - For large catalogues, move videos to object storage (Cloudflare R2, Backblaze B2, S3) and put the URL in "video URL". The server streams it through so the real address stays hidden
 - Encode videos as MP4 (H.264 + AAC) so they play on every phone
+
+## Demo content
+
+The titles, descriptions and numbers in the demo catalogue are made up. Delete them in Admin → Movies once you upload real films.
+
+The demo clips come from [test-videos.co.uk](https://test-videos.co.uk): *Big Buck Bunny* and *Sintel* (© Blender Foundation, CC BY 3.0, blender.org) and a public jellyfish test clip.

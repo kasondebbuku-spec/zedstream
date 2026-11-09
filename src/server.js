@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { config, ROOT } from './config.js';
-import { db, tx } from './db.js';
+import { db, tx, isoIn } from './db.js';
 import * as lipila from './lipila.js';
 
 const app = express();
@@ -101,12 +101,42 @@ function activePurchase(userId, movieId) {
     AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC LIMIT 1`).get(userId, movieId, now());
 }
 
+function activeSeriesPass(userId, series) {
+  if (!series) return null;
+  return db.prepare(`SELECT * FROM series_purchases WHERE user_id = ? AND series = ?
+    AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC LIMIT 1`).get(userId, series, now());
+}
+
+function seriesPass(series) {
+  return series ? db.prepare('SELECT * FROM series_passes WHERE series = ? AND active = 1').get(series) : null;
+}
+
+/** Has the user paid for this title (or does it cost nothing)? Ignores the premiere date. */
 function hasAccess(user, movie) {
   if (!movie) return false;
   if (movie.price <= 0) return true;
   if (!user) return false;
   if (user.role === 'admin') return true;
-  return !!activePurchase(user.id, movie.id);
+  return !!(activePurchase(user.id, movie.id) || activeSeriesPass(user.id, movie.series));
+}
+
+const isReleased = (m) => !m.premiere_at || m.premiere_at <= now();
+
+/** Can the user press play right now? Paid for, and past the premiere time (admins can preview early). */
+const canWatch = (user, m) => hasAccess(user, m) && (isReleased(m) || user?.role === 'admin');
+
+/** Rental end date. For pre-orders, the rental period starts at the premiere, not at payment. */
+function rentalExpiry(days, premiereAt) {
+  if (!(days > 0)) return null;
+  const start = premiereAt && premiereAt > now() ? new Date(premiereAt.replace(' ', 'T') + 'Z').getTime() : Date.now();
+  return new Date(start + days * 864e5).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+/** Text shown over paid videos so screen recordings can be traced to the account. */
+function watermarkFor(user) {
+  if (!user) return null;
+  const who = user.phone ? `0${user.phone.slice(3)}` : user.email;
+  return `${who} · ID ${user.id}`;
 }
 
 function publicMovie(m) {
@@ -133,6 +163,8 @@ function publicMovie(m) {
     ratingCount: m.rating_count,
     createdAt: m.created_at,
     hasVideo: !!(m.video_path || m.video_url),
+    premiereAt: m.premiere_at ? m.premiere_at.replace(' ', 'T') + 'Z' : null,
+    released: isReleased(m),
   };
 }
 
@@ -216,10 +248,25 @@ app.get('/api/movies/:id', (req, res) => {
     extra.progress = db.prepare('SELECT seconds, duration FROM progress WHERE user_id = ? AND movie_id = ?').get(req.user.id, m.id) || null;
     extra.inWatchlist = !!db.prepare('SELECT 1 FROM watchlist WHERE user_id = ? AND movie_id = ?').get(req.user.id, m.id);
   }
+  const pass = seriesPass(m.series);
+  const ownedPass = req.user ? activeSeriesPass(req.user.id, m.series) : null;
+  const paidEpisodes = episodes.filter((e) => e.price > 0);
   res.json({
     movie: publicMovie(m),
     hasAccess: access,
-    accessExpiresAt: purchase?.expires_at || null,
+    canWatch: canWatch(req.user, m),
+    accessExpiresAt: ownedPass ? ownedPass.expires_at : purchase?.expires_at || null,
+    seriesPass: pass ? {
+      series: pass.series,
+      price: pass.price,
+      accessDays: pass.access_days,
+      episodes: episodes.length,
+      paidEpisodes: paidEpisodes.length,
+      fullPrice: paidEpisodes.reduce((a, e) => a + e.price, 0),
+      owned: !!ownedPass,
+      poster: episodes[0]?.poster || publicMovie(m).poster,
+    } : null,
+    watermark: m.price > 0 ? watermarkFor(req.user) : null,
     episodes,
     related,
     ...extra,
@@ -247,7 +294,7 @@ app.post('/api/movies/:id/rate', requireAuth, (req, res) => {
 
 app.post('/api/movies/:id/view', (req, res) => {
   const m = db.prepare('SELECT * FROM movies WHERE id = ?').get(req.params.id);
-  if (!m || !hasAccess(req.user, m)) return res.json({ ok: false });
+  if (!m || !canWatch(req.user, m)) return res.json({ ok: false });
   const viewer = req.user ? `u${req.user.id}` : `ip${req.ip}`;
   const recent = db.prepare(`SELECT 1 FROM view_log WHERE movie_id = ? AND viewer = ? AND created_at > datetime('now', '-6 hours')`).get(m.id, viewer);
   if (!recent) {
@@ -287,7 +334,13 @@ app.get('/api/me/library', requireAuth, (req, res) => {
     ORDER BY w.created_at DESC`).all(uid).map(publicMovie);
   const payments = db.prepare(`SELECT reference_id, movie_id, movie_title, amount, currency, phone, operator, status, provider_message, created_at
     FROM payments WHERE user_id = ? ORDER BY id DESC LIMIT 50`).all(uid);
-  res.json({ continueWatching: cont, purchases, watchlist, payments });
+  // Season passes show up as the series' first episode, marked as a pass.
+  const passes = db.prepare(`SELECT sp.series, sp.expires_at, sp.created_at AS bought_at FROM series_purchases sp WHERE sp.user_id = ? ORDER BY sp.id DESC`).all(uid)
+    .map((p) => {
+      const first = db.prepare('SELECT * FROM movies WHERE series = ? AND published = 1 ORDER BY episode, id LIMIT 1').get(p.series);
+      return first && { ...publicMovie(first), title: `${p.series} · Season pass`, seasonPass: true, expiresAt: p.expires_at, boughtAt: p.bought_at, active: !p.expires_at || p.expires_at > now() };
+    }).filter(Boolean);
+  res.json({ continueWatching: cont, purchases: [...passes, ...purchases], watchlist, payments });
 });
 
 // ---------- Generated artwork for movies without uploaded posters ----------
@@ -325,6 +378,7 @@ app.get('/api/stream/:id', asyncH(async (req, res) => {
   const m = db.prepare('SELECT * FROM movies WHERE id = ?').get(req.params.id);
   if (!m) return res.status(404).end();
   if (!hasAccess(req.user, m)) return res.status(402).json({ error: 'Payment required to watch this movie.' });
+  if (!canWatch(req.user, m)) return res.status(425).json({ error: 'This movie has not premiered yet.', premiereAt: m.premiere_at });
   res.set('Cache-Control', 'private, no-store');
 
   if (m.video_path) {
@@ -352,7 +406,19 @@ app.get('/api/stream/:id', asyncH(async (req, res) => {
     // Proxy remote video so the real URL is never exposed to the browser.
     const ac = new AbortController();
     req.on('close', () => ac.abort());
-    const upstream = await fetch(m.video_url, { headers: req.headers.range ? { Range: req.headers.range } : {}, signal: ac.signal });
+    // One retry: remote hosts sometimes drop a connection.
+    let upstream;
+    for (let attempt = 1; attempt <= 2 && !upstream; attempt++) {
+      try {
+        upstream = await fetch(m.video_url, { headers: req.headers.range ? { Range: req.headers.range } : {}, signal: ac.signal });
+      } catch (e) {
+        if (ac.signal.aborted) return;
+        if (attempt === 2) {
+          console.warn(`Video host unreachable for movie ${m.id}:`, e.cause?.code || e.message);
+          return res.status(502).json({ error: 'The video host did not respond. Please try again.' });
+        }
+      }
+    }
     res.status(upstream.status);
     for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
       const v = upstream.headers.get(h);
@@ -375,10 +441,14 @@ function applyPaymentResult(payment, data) {
       const r = db.prepare(`UPDATE payments SET status = 'successful', provider_status = ?, provider_message = ?, provider_id = COALESCE(?, provider_id),
         raw = ?, updated_at = datetime('now') WHERE id = ? AND status != 'successful'`)
         .run(String(data.status), message, data.identifier || null, JSON.stringify(data), payment.id);
-      if (r.changes && payment.movie_id) {
-        const movie = db.prepare('SELECT access_days FROM movies WHERE id = ?').get(payment.movie_id);
-        const expires = movie?.access_days > 0 ? new Date(Date.now() + movie.access_days * 864e5).toISOString().replace('T', ' ').slice(0, 19) : null;
-        db.prepare('INSERT INTO purchases (user_id, movie_id, payment_id, expires_at) VALUES (?, ?, ?, ?)').run(payment.user_id, payment.movie_id, payment.id, expires);
+      if (r.changes && payment.series) {
+        const pass = db.prepare('SELECT access_days FROM series_passes WHERE series = ?').get(payment.series);
+        db.prepare('INSERT INTO series_purchases (user_id, series, payment_id, expires_at) VALUES (?, ?, ?, ?)')
+          .run(payment.user_id, payment.series, payment.id, rentalExpiry(pass?.access_days, null));
+      } else if (r.changes && payment.movie_id) {
+        const movie = db.prepare('SELECT access_days, premiere_at FROM movies WHERE id = ?').get(payment.movie_id);
+        db.prepare('INSERT INTO purchases (user_id, movie_id, payment_id, expires_at) VALUES (?, ?, ?, ?)')
+          .run(payment.user_id, payment.movie_id, payment.id, rentalExpiry(movie?.access_days, movie?.premiere_at));
       }
     });
   } else if (status === 'failed') {
@@ -394,22 +464,32 @@ function applyPaymentResult(payment, data) {
 const payLimiter = rateLimit({ windowMs: 10 * 60e3, max: 10 });
 
 app.post('/api/payments', requireAuth, payLimiter, asyncH(async (req, res) => {
-  const movie = db.prepare('SELECT * FROM movies WHERE id = ? AND published = 1').get(req.body?.movieId);
-  if (!movie) return res.status(404).json({ error: 'Movie not found.' });
-  if (movie.price <= 0) return res.status(400).json({ error: 'This movie is free.' });
-  if (hasAccess(req.user, movie)) return res.status(409).json({ error: 'You already have access to this movie.' });
+  // What is being bought: one title ({ movieId }) or a season pass ({ series }).
+  let item;
+  if (req.body?.series) {
+    const pass = seriesPass(String(req.body.series));
+    if (!pass) return res.status(404).json({ error: 'No season pass is on sale for this series.' });
+    if (activeSeriesPass(req.user.id, pass.series)) return res.status(409).json({ error: 'You already have the season pass.' });
+    item = { movieId: null, series: pass.series, title: `${pass.series} · Season pass`, price: pass.price };
+  } else {
+    const movie = db.prepare('SELECT * FROM movies WHERE id = ? AND published = 1').get(req.body?.movieId);
+    if (!movie) return res.status(404).json({ error: 'Movie not found.' });
+    if (movie.price <= 0) return res.status(400).json({ error: 'This movie is free.' });
+    if (hasAccess(req.user, movie)) return res.status(409).json({ error: 'You already have access to this movie.' });
+    item = { movieId: movie.id, series: null, title: movie.title, price: movie.price };
+  }
   const phone = lipila.normalizePhone(req.body?.phone);
   if (!phone) return res.status(400).json({ error: 'Enter a valid MTN, Airtel or Zamtel number, e.g. 0977123456.' });
 
   // Re-use a payment that is still waiting for the PIN instead of sending a second prompt.
-  const pending = db.prepare(`SELECT * FROM payments WHERE user_id = ? AND movie_id = ? AND phone = ? AND status = 'pending'
-    AND created_at > datetime('now', '-2 minutes') ORDER BY id DESC LIMIT 1`).get(req.user.id, movie.id, phone);
+  const pending = db.prepare(`SELECT * FROM payments WHERE user_id = ? AND movie_id IS ? AND series IS ? AND phone = ? AND status = 'pending'
+    AND created_at > datetime('now', '-2 minutes') ORDER BY id DESC LIMIT 1`).get(req.user.id, item.movieId, item.series, phone);
   if (pending) return res.json({ referenceId: pending.reference_id, status: 'pending', message: 'Check your phone to approve the payment.' });
 
   const referenceId = `ZS${Date.now()}${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
   const operator = lipila.detectOperator(phone);
-  const ins = db.prepare(`INSERT INTO payments (reference_id, user_id, movie_id, movie_title, amount, currency, phone, operator, mode)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(referenceId, req.user.id, movie.id, movie.title, movie.price, config.currency, phone, operator, lipila.lipilaMode());
+  const ins = db.prepare(`INSERT INTO payments (reference_id, user_id, movie_id, series, movie_title, amount, currency, phone, operator, mode)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(referenceId, req.user.id, item.movieId, item.series, item.title, item.price, config.currency, phone, operator, lipila.lipilaMode());
   const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(ins.lastInsertRowid);
 
   if (!req.user.phone) db.prepare('UPDATE users SET phone = ? WHERE id = ?').run(phone, req.user.id);
@@ -417,9 +497,9 @@ app.post('/api/payments', requireAuth, payLimiter, asyncH(async (req, res) => {
   try {
     const result = await lipila.createCollection({
       referenceId,
-      amount: movie.price,
+      amount: item.price,
       phone,
-      narration: `${config.siteName}: ${movie.title}`.slice(0, 60),
+      narration: `${config.siteName}: ${item.title}`.slice(0, 60),
       email: req.user.email,
     });
     const updated = applyPaymentResult(payment, result);
@@ -468,6 +548,13 @@ function removeFile(dir, name) {
   if (name) fs.rm(path.join(dir, path.basename(name)), { force: true }, () => {});
 }
 
+/** Browser ISO time -> SQLite UTC 'YYYY-MM-DD HH:MM:SS' (null when empty or invalid). */
+function toDbTime(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
 function movieFields(body) {
   const num = (v, d = null) => (v === undefined || v === '' ? d : Number(v));
   return {
@@ -485,6 +572,7 @@ function movieFields(body) {
     episode: num(body.episode),
     featured: body.featured === 'true' || body.featured === '1' || body.featured === 'on' ? 1 : 0,
     published: body.published === 'false' || body.published === '0' ? 0 : 1,
+    premiere_at: toDbTime(body.premiereAt),
   };
 }
 
@@ -500,9 +588,9 @@ app.post('/api/admin/movies', requireAuth, requireAdmin, upload, (req, res) => {
   if (!f.title) return res.status(400).json({ error: 'Title is required.' });
   const files = req.files || {};
   const r = db.prepare(`INSERT INTO movies (title, description, genre, year, duration_min, age_rating, price, access_days, video_url, trailer_url,
-    series, episode, featured, published, poster, backdrop, video_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    series, episode, featured, published, premiere_at, poster, backdrop, video_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(f.title, f.description, f.genre, f.year, f.duration_min, f.age_rating, f.price, f.access_days, f.video_url, f.trailer_url,
-      f.series, f.episode, f.featured, f.published, files.poster?.[0]?.filename || null, files.backdrop?.[0]?.filename || null, files.video?.[0]?.filename || null);
+      f.series, f.episode, f.featured, f.published, f.premiere_at, files.poster?.[0]?.filename || null, files.backdrop?.[0]?.filename || null, files.video?.[0]?.filename || null);
   res.json({ movie: publicMovie(db.prepare('SELECT * FROM movies WHERE id = ?').get(r.lastInsertRowid)) });
 });
 
@@ -519,9 +607,9 @@ app.put('/api/admin/movies/:id', requireAuth, requireAdmin, upload, (req, res) =
   if (backdrop !== m.backdrop) removeFile(IMG_DIR, m.backdrop);
   if (video !== m.video_path) removeFile(VIDEO_DIR, m.video_path);
   db.prepare(`UPDATE movies SET title=?, description=?, genre=?, year=?, duration_min=?, age_rating=?, price=?, access_days=?, video_url=?, trailer_url=?,
-    series=?, episode=?, featured=?, published=?, poster=?, backdrop=?, video_path=? WHERE id = ?`)
+    series=?, episode=?, featured=?, published=?, premiere_at=?, poster=?, backdrop=?, video_path=? WHERE id = ?`)
     .run(f.title, f.description, f.genre, f.year, f.duration_min, f.age_rating, f.price, f.access_days, f.video_url, f.trailer_url,
-      f.series, f.episode, f.featured, f.published, poster, backdrop, video, m.id);
+      f.series, f.episode, f.featured, f.published, f.premiere_at, poster, backdrop, video, m.id);
   res.json({ movie: publicMovie(db.prepare('SELECT * FROM movies WHERE id = ?').get(m.id)) });
 });
 
@@ -544,7 +632,7 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, (_req, res) => {
     WHERE status = 'successful' AND created_at > datetime('now', '-14 days') GROUP BY day ORDER BY day`).all();
   const byOperator = db.prepare(`SELECT operator, SUM(amount) AS total, COUNT(*) AS n FROM payments WHERE status = 'successful' GROUP BY operator`).all();
   const topMovies = db.prepare(`SELECT movie_title AS title, SUM(amount) AS total, COUNT(*) AS n FROM payments WHERE status = 'successful'
-    GROUP BY movie_id ORDER BY total DESC LIMIT 5`).all();
+    GROUP BY movie_title ORDER BY total DESC LIMIT 5`).all();
   res.json({
     revenue: revenue.total, sales: revenue.n, revenueToday: today.total, salesToday: today.n,
     users: one('SELECT COUNT(*) AS n FROM users').n,
@@ -576,6 +664,27 @@ app.post('/api/admin/grant', requireAuth, requireAdmin, (req, res) => {
   if (!u || !m) return res.status(404).json({ error: 'User or movie not found.' });
   const expires = Number(days) > 0 ? new Date(Date.now() + Number(days) * 864e5).toISOString().replace('T', ' ').slice(0, 19) : null;
   db.prepare('INSERT INTO purchases (user_id, movie_id, expires_at) VALUES (?, ?, ?)').run(u.id, m.id, expires);
+  res.json({ ok: true });
+});
+
+// Season passes: one row per series that has episodes.
+app.get('/api/admin/series', requireAuth, requireAdmin, (_req, res) => {
+  const rows = db.prepare(`SELECT series, COUNT(*) AS episodes, SUM(CASE WHEN price > 0 THEN price ELSE 0 END) AS full_price
+    FROM movies WHERE series IS NOT NULL AND series != '' GROUP BY series ORDER BY series`).all();
+  res.json({ series: rows.map((r) => {
+    const p = db.prepare('SELECT * FROM series_passes WHERE series = ?').get(r.series);
+    const sold = db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS total FROM payments WHERE series = ? AND status = 'successful'`).get(r.series);
+    return { series: r.series, episodes: r.episodes, fullPrice: r.full_price, pass: p ? { price: p.price, accessDays: p.access_days, active: !!p.active } : null, sales: sold.n, revenue: sold.total };
+  }) });
+});
+
+app.put('/api/admin/series-pass', requireAuth, requireAdmin, (req, res) => {
+  const { series, price, accessDays, active } = req.body || {};
+  if (!series || !db.prepare('SELECT 1 FROM movies WHERE series = ?').get(series)) return res.status(404).json({ error: 'Series not found.' });
+  if (!(Number(price) > 0)) return res.status(400).json({ error: 'Enter a price above 0.' });
+  db.prepare(`INSERT INTO series_passes (series, price, access_days, active) VALUES (?, ?, ?, ?)
+    ON CONFLICT(series) DO UPDATE SET price = excluded.price, access_days = excluded.access_days, active = excluded.active`)
+    .run(series, Number(price), Math.max(0, Number(accessDays) || 0), active === false ? 0 : 1);
   res.json({ ok: true });
 });
 

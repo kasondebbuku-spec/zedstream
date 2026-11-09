@@ -1,4 +1,4 @@
-import { api, state, esc, $, $$, money, compact, dur, fmtDate, accessLabel, toast, movieCard, skeletonRow, requireUser } from './core.js';
+import { api, state, esc, $, $$, money, compact, dur, fmtDate, fmtPremiere, countdown, isUpcoming, accessLabel, toast, movieCard, skeletonRow, requireUser } from './core.js';
 import { openAuth, logout } from './auth.js';
 import { openPay } from './pay.js';
 
@@ -118,6 +118,7 @@ async function renderHome(query) {
   const genres = {};
   movies.forEach((m) => m.genres.forEach((g) => (genres[g] ||= []).push(m)));
   const topGenres = Object.entries(genres).filter(([, l]) => l.length >= 2).sort((a, b) => b[1].length - a[1].length).slice(0, 4);
+  const comingSoon = movies.filter(isUpcoming).sort((a, b) => new Date(a.premiereAt) - new Date(b.premiereAt));
   const free = movies.filter((m) => m.price <= 0);
   const paid = movies.filter((m) => m.price > 0);
   const row = (title, list, opts) => (list.length ? `<section class="section"><div class="section-head"><h2>${esc(title)}</h2></div>
@@ -134,6 +135,7 @@ async function renderHome(query) {
       <div><h3>Watch the latest Zambian blockbusters</h3><p>Pay in seconds with mobile money. No card needed.</p></div>
       <div class="ops"><span class="op mtn">MTN MoMo</span><span class="op airtel">Airtel Money</span><span class="op zamtel">Zamtel Kwacha</span></div>
     </div>
+    ${row('Coming soon – pre-order now', comingSoon)}
     ${lib ? row('Continue watching', lib.continueWatching, { landscape: true, withProgress: true }) : ''}
     ${row('Trending now', popular.movies.slice(0, 15))}
     ${row('New releases', movies.slice(0, 15))}
@@ -157,6 +159,7 @@ async function renderHome(query) {
     $$('.hero-dots button').forEach((s, j) => s.classList.toggle('active', j === i));
     const m = heroItems[i];
     $('#heroContent').innerHTML = `
+      ${isUpcoming(m) ? `<div class="hero-premiere">🎬 PREMIERE · ${esc(fmtPremiere(m.premiereAt))} · <span id="heroCd">${countdown(m.premiereAt)}</span></div>` : ''}
       <h1 class="hero-title">${esc(m.title)}</h1>
       <div class="meta">
         ${m.rating ? `<span class="star">★ ${m.rating.toFixed(1)}</span>` : ''}
@@ -168,7 +171,9 @@ async function renderHome(query) {
       </div>
       <p class="hero-desc">${esc(m.description)}</p>
       <div class="hero-actions">
-        <a class="btn primary" href="#/watch/${m.id}?play=1">▶ Watch Now</a>
+        ${isUpcoming(m)
+          ? `<a class="btn primary" href="#/watch/${m.id}">🎬 ${m.price > 0 ? `Pre-order ${money(m.price)}` : 'Remind me'}</a>`
+          : `<a class="btn primary" href="#/watch/${m.id}?play=1">▶ Watch Now</a>`}
         <a class="btn ghost" href="#/watch/${m.id}">ⓘ More info</a>
       </div>`;
   };
@@ -178,6 +183,11 @@ async function renderHome(query) {
   const restart = () => { clearInterval(timer); if (heroItems.length > 1) timer = setInterval(() => showSlide((idx + 1) % heroItems.length), 7000); };
   restart();
   onCleanup(() => clearInterval(timer));
+  const heroCdTimer = setInterval(() => {
+    const el = $('#heroCd');
+    if (el) el.textContent = countdown(heroItems[idx].premiereAt) || 'Out now';
+  }, 1000);
+  onCleanup(() => clearInterval(heroCdTimer));
 
   $$('#chips .chip').forEach((c) => (c.onclick = () => { allMoviesFilter = c.dataset.f; loadAllMovies(); }));
   $('#sortSelect').value = allMoviesSort;
@@ -209,35 +219,92 @@ async function renderWatch(id, { autoplay = false } = {}) {
   window.scrollTo(0, 0);
   app.innerHTML = '<div class="player-wrap skel" style="border-radius:0"></div>';
   const data = await api(`/movies/${id}`);
-  const { movie: m, hasAccess, episodes, related } = data;
+  const { movie: m, hasAccess, canWatch, episodes, related, seriesPass: pass, watermark } = data;
   document.title = `${m.title} – ${state.config.siteName}`;
   onCleanup(() => (document.title = state.config.siteName));
 
+  const upcoming = isUpcoming(m);
   const idxEp = episodes.findIndex((e) => e.id === m.id);
   const nextEp = idxEp >= 0 ? episodes[idxEp + 1] : null;
   const resumeAt = data.progress && data.progress.seconds > 10 && (!data.progress.duration || data.progress.seconds < data.progress.duration * 0.95) ? data.progress.seconds : 0;
 
-  const payFlow = () => requireUser(async () => {
-    const fresh = await api(`/movies/${id}`);
-    if (fresh.hasAccess) return renderWatch(id, { autoplay: true });
-    openPay(m, () => renderWatch(id, { autoplay: true }));
+  // Season pass offer, shaped like a movie so the checkout can sell it.
+  const passItem = pass && !pass.owned ? {
+    id: m.id,
+    title: `${pass.series} · Season pass`,
+    poster: pass.poster,
+    price: pass.price,
+    accessDays: pass.accessDays,
+    note: `All ${pass.episodes} episodes, new ones included · ${accessLabel(pass.accessDays)}`,
+    payload: { series: pass.series },
+  } : null;
+  const passSave = pass ? Math.max(0, pass.fullPrice - pass.price) : 0;
+  const passLabel = passItem ? `Season pass ${money(pass.price)}${passSave ? ` · save ${money(passSave)}` : ''}` : '';
+
+  // One checkout at a time: extra taps while it loads are ignored.
+  let opening = false;
+  const payFlow = (item) => requireUser(async () => {
+    if (opening || document.querySelector('.modal')) return;
+    opening = true;
+    const btns = $$('#payBtn, #payBtn2, #passBtn, #passBtn2');
+    btns.forEach((b) => { b.disabled = true; });
+    try {
+      const fresh = await api(`/movies/${id}`);
+      const alreadyOwned = item.payload?.series ? fresh.seriesPass?.owned : fresh.hasAccess;
+      if (alreadyOwned) return renderWatch(id, { autoplay: fresh.canWatch });
+      openPay(item, () => renderWatch(id, { autoplay: !upcoming }));
+    } catch (e) {
+      toast(e.message, 'bad');
+    } finally {
+      opening = false;
+      btns.forEach((b) => { b.disabled = false; });
+    }
   });
+
+  const trailerBtn = m.trailerUrl ? '<button class="btn ghost" id="trailerBtn">▶ Trailer</button>' : '';
+  let cover;
+  if (canWatch) {
+    cover = `<div class="play-cover" id="playCover"><div>
+        <button class="big-play" id="bigPlay" aria-label="Play"><svg width="34" height="34" viewBox="0 0 24 24"><path fill="#fff" d="M8 5v14l11-7z"/></svg></button>
+        ${resumeAt ? `<p style="margin:14px 0 0;font-weight:600">Resume from ${Math.floor(resumeAt / 60)}:${String(Math.floor(resumeAt % 60)).padStart(2, '0')}</p>` : ''}
+      </div></div>`;
+  } else if (hasAccess && upcoming) {
+    cover = `<div class="paywall"><div class="paywall-box">
+        <div class="lock-ico">🎬</div>
+        <h2>${m.price > 0 ? "You're booked for the premiere!" : 'Free premiere'}</h2>
+        <p>${esc(m.title)} premieres ${esc(fmtPremiere(m.premiereAt))}. It unlocks here automatically.</p>
+        <div class="countdown" id="cd"></div>
+        ${trailerBtn}
+      </div></div>`;
+  } else {
+    cover = `<div class="paywall"><div class="paywall-box">
+        <div class="lock-ico">${upcoming ? '🎬' : '🔒'}</div>
+        <h2>${upcoming ? `Premieres ${esc(fmtPremiere(m.premiereAt))}` : `Unlock “${esc(m.title)}”`}</h2>
+        ${upcoming ? '<div class="countdown" id="cd"></div>' : ''}
+        <p>${upcoming ? `Pre-order for <b>${money(m.price)}</b> and watch the moment it premieres.` : `Pay <b>${money(m.price)}</b> with mobile money · ${accessLabel(m.accessDays)}`}</p>
+        <div class="pay-options">
+          <button class="btn primary" id="payBtn">${upcoming ? `Pre-order ${money(m.price)}` : `Pay ${money(m.price)} with Mobile Money`}</button>
+          ${passItem ? `<button class="btn ghost" id="passBtn">${passLabel}</button>` : ''}
+          ${trailerBtn}
+        </div>
+        <div class="ops"><span class="op mtn">MTN</span><span class="op airtel">Airtel</span><span class="op zamtel">Zamtel</span></div>
+      </div></div>`;
+  }
+
+  let accessNote = '';
+  if (state.user?.role === 'admin' && m.price > 0 && !pass?.owned) accessNote = `<div class="access-note">Admin preview${upcoming ? ` · public premiere ${esc(fmtPremiere(m.premiereAt))}` : ''}</div>`;
+  else if (pass?.owned) accessNote = `<div class="access-note">✓ Season pass${data.accessExpiresAt ? ` · until ${fmtDate(data.accessExpiresAt)}` : ''}</div>`;
+  else if (m.price > 0 && hasAccess && upcoming) accessNote = `<div class="access-note">✓ Pre-ordered · premieres ${esc(fmtPremiere(m.premiereAt))}</div>`;
+  else if (m.price > 0 && hasAccess) accessNote = `<div class="access-note">✓ Unlocked${data.accessExpiresAt ? ` · until ${fmtDate(data.accessExpiresAt)}` : ''}</div>`;
+
+  let mainAction = '';
+  if (canWatch) mainAction = '<button class="btn primary" id="playBtn2">▶ Play</button>';
+  else if (!hasAccess) mainAction = `<button class="btn primary" id="payBtn2">${upcoming ? 'Pre-order' : 'Pay'} ${money(m.price)}</button>`;
 
   app.innerHTML = `
     <div class="player-wrap" id="player">
       <img class="backdrop" src="${esc(m.backdrop)}" alt="">
-      ${hasAccess ? `<div class="play-cover" id="playCover"><div>
-          <button class="big-play" id="bigPlay" aria-label="Play"><svg width="34" height="34" viewBox="0 0 24 24"><path fill="#fff" d="M8 5v14l11-7z"/></svg></button>
-          ${resumeAt ? `<p style="margin:14px 0 0;font-weight:600">Resume from ${Math.floor(resumeAt / 60)}:${String(Math.floor(resumeAt % 60)).padStart(2, '0')}</p>` : ''}
-        </div></div>`
-      : `<div class="paywall"><div class="paywall-box">
-          <div class="lock-ico">🔒</div>
-          <h2>Unlock “${esc(m.title)}”</h2>
-          <p>Pay <b>${money(m.price)}</b> with mobile money · ${accessLabel(m.accessDays)}</p>
-          <button class="btn primary" id="payBtn">Pay ${money(m.price)} with Mobile Money</button>
-          ${m.trailerUrl ? '<button class="btn ghost" id="trailerBtn" style="margin-left:6px">▶ Trailer</button>' : ''}
-          <div class="ops"><span class="op mtn">MTN</span><span class="op airtel">Airtel</span><span class="op zamtel">Zamtel</span></div>
-        </div></div>`}
+      ${cover}
     </div>
 
     <section class="detail">
@@ -245,47 +312,74 @@ async function renderWatch(id, { autoplay = false } = {}) {
       <div>
         <h1>${esc(m.title)}${m.series && m.episode ? ` <span class="muted" style="font-weight:600;font-size:.55em">Episode ${m.episode}</span>` : ''}</h1>
         <div class="meta">
+          ${upcoming ? `<span class="tag-premiere">🎬 Premieres ${esc(fmtPremiere(m.premiereAt))}</span>` : ''}
           ${m.rating ? `<span class="star">★ ${m.rating.toFixed(1)}</span><span class="muted">(${m.ratingCount})</span>` : ''}
-          <span>👁 ${compact(m.views)} views</span>
+          ${upcoming ? '' : `<span>👁 ${compact(m.views)} views</span>`}
           ${m.year ? `<span>${m.year}</span>` : ''}
           ${m.ageRating ? `<span class="pill">${esc(m.ageRating)}+</span>` : ''}
           ${m.durationMin ? `<span>${dur(m.durationMin)}</span>` : ''}
           ${m.genres.length ? `<span>${esc(m.genres.join(' · '))}</span>` : ''}
           ${m.price > 0 ? `<span class="tag-paid">${money(m.price)}</span>` : '<span class="tag-free">FREE</span>'}
         </div>
-        ${m.price > 0 && hasAccess ? `<div class="access-note">✓ Unlocked${data.accessExpiresAt ? ` · until ${fmtDate(data.accessExpiresAt)}` : ''}</div>` : ''}
+        ${accessNote}
         <div class="detail-actions">
-          ${hasAccess ? '<button class="btn primary" id="playBtn2">▶ Play</button>' : `<button class="btn primary" id="payBtn2">Pay ${money(m.price)}</button>`}
+          ${mainAction}
           <button class="btn outline" id="listBtn">${data.inWatchlist ? '✓ In My List' : '+ My List'}</button>
           <button class="btn outline" id="shareBtn">↗ Share</button>
         </div>
         <p class="desc">${esc(m.description)}</p>
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        ${upcoming ? '' : `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <span class="muted">Your rating:</span>
           <div class="stars" id="stars">${[1, 2, 3, 4, 5].map((s) => `<button data-s="${s}" class="${s <= (data.userRating || 0) ? 'on' : ''}" aria-label="${s} stars">★</button>`).join('')}</div>
-        </div>
+        </div>`}
       </div>
     </section>
 
     ${episodes.length > 1 ? `<section class="section"><div class="section-head"><h2>${esc(m.series)} · Episodes</h2></div>
+      ${passItem ? `<div class="pass-box">
+        <div><b>Season pass · ${money(pass.price)}</b>
+          <p>Unlock all ${pass.episodes} episodes in one payment${passSave ? ` and save ${money(passSave)}` : ''}. New episodes are included free.</p></div>
+        <button class="btn primary" id="passBtn2">Get season pass</button>
+      </div>` : pass?.owned ? '<div class="access-note" style="margin-bottom:12px">✓ You have the season pass for every episode</div>' : ''}
       <div class="episodes">${episodes.map((e) => `<a class="ep ${e.id === m.id ? 'current' : ''}" href="#/watch/${e.id}">
         <div class="ep-num">${e.episode ?? ''}</div>
         <div class="ep-img"><img src="${esc(e.backdrop)}" alt="" loading="lazy"></div>
         <div><h4>${e.episode ? `Episode ${e.episode}` : esc(e.title)}</h4><p>${esc(e.description)}</p></div>
-        <div>${e.price > 0 ? `<span class="badge paid" style="position:static">${money(e.price)}</span>` : '<span class="tag-free">FREE</span>'}</div>
+        <div>${e.price <= 0 ? '<span class="tag-free">FREE</span>' : pass?.owned ? '<span class="tag-free">✓</span>' : `<span class="badge paid" style="position:static">${money(e.price)}</span>`}</div>
       </a>`).join('')}</div></section>` : ''}
 
     ${related.length ? `<section class="section"><div class="section-head"><h2>More like this</h2></div>
       <div class="row">${related.map((r) => movieCard(r)).join('')}</div></section>` : ''}`;
+
+  // Premiere countdown: re-render the page the moment it premieres.
+  const cd = $('#cd');
+  if (cd) {
+    const tick = () => {
+      const left = countdown(m.premiereAt);
+      if (!left) { clearInterval(timer); renderWatch(id); return; }
+      cd.innerHTML = left.split(' ').map((p) => `<span><b>${p.replace(/\D+$/, '')}</b>${p.replace(/^\d+/, '')}</span>`).join('');
+    };
+    const timer = setInterval(tick, 1000);
+    tick();
+    onCleanup(() => clearInterval(timer));
+  }
 
   // Player
   let video;
   const startPlayback = () => {
     if (video) { video.play(); return; }
     const wrap = $('#player');
-    wrap.innerHTML = `<video id="video" controls playsinline autoplay preload="auto" poster="${esc(m.backdrop)}" controlsList="nodownload" src="/api/stream/${m.id}"></video>`;
+    // Paid titles get a moving watermark with the viewer's number. Native fullscreen and
+    // picture-in-picture are turned off for them because they would hide the watermark.
+    wrap.innerHTML = `<video id="video" controls playsinline autoplay preload="auto" poster="${esc(m.backdrop)}"
+        controlsList="nodownload${watermark ? ' nofullscreen' : ''}" ${watermark ? 'disablePictureInPicture' : ''} src="/api/stream/${m.id}"></video>
+      ${watermark ? `<div class="watermark" id="wm">${esc(watermark)}</div>
+        <button class="fs-btn" id="fsBtn" aria-label="Full screen" title="Full screen">⛶</button>` : ''}`;
     video = $('#video');
+    // Start playback inside the tap that called us; browsers can ignore the autoplay attribute.
+    video.play().catch(() => {});
     video.oncontextmenu = (e) => e.preventDefault();
+    if (watermark) setupWatermark(wrap, video);
     let counted = false;
     let lastSave = 0;
     const save = () => {
@@ -310,23 +404,33 @@ async function renderWatch(id, { autoplay = false } = {}) {
     });
     video.addEventListener('error', async () => {
       const r = await fetch(`/api/stream/${m.id}`, { method: 'HEAD' }).catch(() => null);
-      toast(r?.status === 402 ? 'Your access has expired. Please pay again to watch.' : 'Could not load the video. Please try again.', 'bad');
+      if (r?.status === 402) return toast('Your access has expired. Please pay again to watch.', 'bad');
+      // Show a retry button over the player instead of leaving a dead video.
+      if ($('#retryVideo')) return;
+      const b = document.createElement('button');
+      b.id = 'retryVideo';
+      b.className = 'btn primary next-up';
+      b.textContent = '↻ Video did not load. Try again';
+      b.onclick = () => { b.remove(); video.load(); video.play().catch(() => {}); };
+      $('#player').append(b);
     });
     onCleanup(save);
     wrap.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
-  if (hasAccess) {
-    $('#bigPlay').onclick = startPlayback;
-    $('#playBtn2').onclick = startPlayback;
-    if (autoplay) startPlayback();
-  } else {
-    $('#payBtn').onclick = payFlow;
-    $('#payBtn2').onclick = payFlow;
-    $('#trailerBtn')?.addEventListener('click', () => {
-      $('#player').innerHTML = `<video controls autoplay playsinline src="${esc(m.trailerUrl)}"></video>`;
-    });
-    if (autoplay) payFlow();
+  const on = (sel, fn) => $(sel)?.addEventListener('click', fn);
+  on('#bigPlay', startPlayback);
+  on('#playBtn2', startPlayback);
+  on('#payBtn', () => payFlow(m));
+  on('#payBtn2', () => payFlow(m));
+  on('#passBtn', () => payFlow(passItem));
+  on('#passBtn2', () => payFlow(passItem));
+  on('#trailerBtn', () => {
+    $('#player').innerHTML = `<video controls autoplay playsinline src="${esc(m.trailerUrl)}"></video>`;
+  });
+  if (autoplay) {
+    if (canWatch) startPlayback();
+    else if (!hasAccess) payFlow(m);
   }
 
   $('#listBtn').onclick = () => requireUser(async () => {
@@ -344,6 +448,44 @@ async function renderWatch(id, { autoplay = false } = {}) {
     $$('#stars button').forEach((x) => x.classList.toggle('on', +x.dataset.s <= r.userRating));
     toast(`Thanks! Rated ${r.userRating}★`, 'ok');
   })));
+}
+
+/** Moves the watermark around and keeps it visible in fullscreen. */
+function setupWatermark(wrap, video) {
+  const wm = $('#wm', wrap);
+  const move = () => {
+    wm.style.top = `${8 + Math.random() * 72}%`;
+    wm.style.left = `${4 + Math.random() * 56}%`;
+  };
+  move();
+  const timer = setInterval(move, 12000);
+  onCleanup(() => clearInterval(timer));
+
+  // Fullscreen the wrapper (video + watermark), never the bare video.
+  const isFs = () => document.fullscreenElement === wrap || wrap.classList.contains('pseudo-fs');
+  const toggle = async () => {
+    if (isFs()) {
+      if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
+      wrap.classList.remove('pseudo-fs');
+      document.body.classList.remove('no-scroll');
+    } else if (wrap.requestFullscreen) {
+      await wrap.requestFullscreen().catch(() => { wrap.classList.add('pseudo-fs'); document.body.classList.add('no-scroll'); });
+    } else {
+      // iPhone Safari can't fullscreen a div: fill the screen with CSS instead.
+      wrap.classList.add('pseudo-fs');
+      document.body.classList.add('no-scroll');
+    }
+  };
+  $('#fsBtn', wrap).onclick = toggle;
+  video.addEventListener('dblclick', (e) => { e.preventDefault(); toggle(); });
+  const onFs = () => {
+    if (document.fullscreenElement === video) document.exitFullscreen().then(() => wrap.requestFullscreen()).catch(() => {});
+  };
+  document.addEventListener('fullscreenchange', onFs);
+  onCleanup(() => {
+    document.removeEventListener('fullscreenchange', onFs);
+    document.body.classList.remove('no-scroll');
+  });
 }
 
 // ---------------- Library & account ----------------

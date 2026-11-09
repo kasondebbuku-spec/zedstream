@@ -27,6 +27,23 @@ export const dur = (min) => (!min ? '' : min >= 60 ? `${Math.floor(min / 60)}h $
 export const fmtDate = (s) => (s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '');
 export const accessLabel = (days) => (days > 0 ? `${days}-day access` : 'Lifetime access');
 
+/** "Fri 14 Nov, 21:15" in the viewer's own time zone. */
+export const fmtPremiere = (iso) => new Date(iso).toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+/** Time left until iso, e.g. "4d 21h 13m" or "12m 05s". Empty when it has passed. */
+export function countdown(iso) {
+  let s = Math.floor((new Date(iso) - Date.now()) / 1000);
+  if (s <= 0) return '';
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+  return `${m}m ${String(s).padStart(2, '0')}s`;
+}
+
+export const isUpcoming = (m) => !!m.premiereAt && new Date(m.premiereAt) > Date.now();
+
 export function toast(msg, kind = '') {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
@@ -62,13 +79,15 @@ export function movieCard(m, { progress, landscape = false } = {}) {
   const priceBadge = m.price > 0
     ? `<span class="badge price paid">${money(m.price)}</span>`
     : '<span class="badge price free">Free</span>';
-  const sub = m.series && m.episode ? `Episode ${m.episode}` : [m.year, m.genres?.[0]].filter(Boolean).join(' · ');
+  const upcoming = isUpcoming(m);
+  const sub = m.seasonPass ? 'All episodes' : m.series && m.episode ? `Episode ${m.episode}` : [m.year, m.genres?.[0]].filter(Boolean).join(' · ');
   return `<a class="card ${landscape ? 'landscape' : ''}" href="#/watch/${m.id}" title="${esc(m.title)}">
     <div class="card-img">
       <img src="${esc(landscape ? m.backdrop : m.poster)}" alt="" loading="lazy">
       ${m.rating ? `<span class="badge rating">${m.rating.toFixed(1)}</span>` : ''}
-      ${priceBadge}
-      ${progress === undefined ? `<span class="views">👁 ${compact(m.views)}</span>` : ''}
+      ${m.seasonPass ? '<span class="badge price owned">Season pass</span>' : priceBadge}
+      ${upcoming ? `<span class="views premiere-tag">🎬 ${esc(fmtPremiere(m.premiereAt))}</span>`
+        : progress === undefined ? `<span class="views">👁 ${compact(m.views)}</span>` : ''}
       ${progress !== undefined ? `<div class="progress"><i style="width:${Math.round(progress * 100)}%"></i></div>` : ''}
     </div>
     <div class="card-title">${esc(m.title)}</div>

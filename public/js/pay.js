@@ -1,5 +1,5 @@
 // Mobile money checkout: enter number -> PIN prompt on phone -> poll status -> unlock.
-import { api, state, modal, esc, money, accessLabel, $ } from './core.js';
+import { api, state, modal, esc, money, accessLabel, fmtPremiere, isUpcoming, $ } from './core.js';
 
 const OPERATORS = { 96: 'mtn', 76: 'mtn', 97: 'airtel', 77: 'airtel', 95: 'zamtel', 75: 'zamtel' };
 const OP_NAMES = { mtn: 'MTN MoMo', airtel: 'Airtel Money', zamtel: 'Zamtel Kwacha' };
@@ -11,7 +11,13 @@ function detect(raw) {
   return { op: OPERATORS[d.slice(0, 2)] || null, valid: /^[79][5-7]\d{7}$/.test(d), local: '0' + d };
 }
 
+/**
+ * item: a movie from the API, or a season pass shaped like one.
+ * Optional: item.payload (what to POST, default { movieId }), item.note (line under the title).
+ */
 export function openPay(movie, onPaid) {
+  const preorder = isUpcoming(movie);
+  const note = movie.note || (preorder ? `Pre-order · unlocks ${fmtPremiere(movie.premiereAt)}` : accessLabel(movie.accessDays));
   const testMode = state.config.paymentMode !== 'live';
   const savedPhone = state.user?.phone ? '0' + state.user.phone.slice(3) : '';
   let pollTimer = null;
@@ -22,7 +28,7 @@ export function openPay(movie, onPaid) {
     <p class="muted" style="margin:0">Pay once and watch on any device.</p>
     <div class="pay-summary">
       <img src="${esc(movie.poster)}" alt="">
-      <div><b>${esc(movie.title)}</b>${movie.episode ? `<div class="muted">Episode ${movie.episode}</div>` : ''}<div class="muted" style="font-size:13px">${accessLabel(movie.accessDays)}</div></div>
+      <div><b>${esc(movie.title)}</b>${movie.episode ? `<div class="muted">Episode ${movie.episode}</div>` : ''}<div class="muted" style="font-size:13px">${esc(note)}</div></div>
       <div class="amt">${money(movie.price)}</div>
     </div>
     <div id="payBody"></div>`, {
@@ -63,7 +69,7 @@ export function openPay(movie, onPaid) {
       btn.disabled = true;
       btn.textContent = 'Sending request…';
       try {
-        const r = await api('/payments', { method: 'POST', body: { movieId: movie.id, phone: local } });
+        const r = await api('/payments', { method: 'POST', body: { ...(movie.payload || { movieId: movie.id }), phone: local } });
         if (r.status === 'successful') return showSuccess();
         if (r.status === 'failed') return showFailed(r.message);
         showWaiting(local, r.referenceId);
@@ -107,8 +113,10 @@ export function openPay(movie, onPaid) {
       <div class="pay-state">
         <div class="result-ico ok">✓</div>
         <h3 style="margin:0 0 6px">Payment received!</h3>
-        <p class="muted">${esc(movie.title)} is unlocked. Enjoy the movie.</p>
-        <button class="btn primary block" id="watchNow">▶ Watch now</button>
+        <p class="muted">${preorder
+          ? `You're booked for the premiere of ${esc(movie.title)} on ${esc(fmtPremiere(movie.premiereAt))}. It unlocks automatically.`
+          : `${esc(movie.title)} is unlocked. Enjoy!`}</p>
+        <button class="btn primary block" id="watchNow">${preorder ? 'Done' : '▶ Watch now'}</button>
       </div>`;
     $('#watchNow', body).onclick = () => { close(); onPaid?.(); };
   }

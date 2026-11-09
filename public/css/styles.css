@@ -327,3 +327,43 @@ td img.thumb { width: 40px; height: 60px; object-fit: cover; border-radius: 4px;
   .player-wrap { max-height: none; }
 }
 .nav a.avatar { padding: 0; width: 36px; height: 36px; }
+
+/* ---------- Anti-piracy watermark & fullscreen ---------- */
+.watermark {
+  position: absolute; z-index: 4; pointer-events: none; user-select: none;
+  color: rgba(255,255,255,.38); font-weight: 700; font-size: clamp(11px, 1.6vw, 16px); letter-spacing: .5px;
+  text-shadow: 0 1px 2px rgba(0,0,0,.6); white-space: nowrap; transition: top 1.5s ease, left 1.5s ease;
+}
+.fs-btn {
+  position: absolute; z-index: 5; top: 10px; right: 10px; width: 40px; height: 40px; border-radius: 8px; border: 0;
+  background: rgba(0,0,0,.55); color: #fff; font-size: 20px; line-height: 1;
+}
+.fs-btn:hover { background: rgba(0,0,0,.8); }
+.player-wrap:fullscreen { max-height: none; aspect-ratio: auto; width: 100vw; height: 100vh; }
+.player-wrap.pseudo-fs { position: fixed; inset: 0; z-index: 300; max-height: none; aspect-ratio: auto; width: 100vw; height: 100vh; }
+body.no-scroll { overflow: hidden; }
+
+/* ---------- Premieres ---------- */
+.countdown { display: flex; gap: 10px; justify-content: center; margin: 4px 0 18px; }
+.countdown span { min-width: 64px; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.15); font-size: 12px; color: #d4d4dc; text-transform: uppercase; }
+.countdown b { display: block; font-size: 26px; color: #fff; line-height: 1.1; }
+.tag-premiere { color: #fcd34d; font-weight: 800; }
+.hero-premiere {
+  display: inline-block; margin-bottom: 12px; padding: 5px 12px; border-radius: 6px; font-weight: 800; font-size: 13px; letter-spacing: .5px;
+  background: rgba(251,191,36,.18); border: 1px solid rgba(251,191,36,.5); color: #fde68a;
+}
+.card .premiere-tag { background: rgba(180,83,9,.9); }
+
+/* ---------- Season pass ---------- */
+.pay-options { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.pass-box {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  padding: 14px 16px; margin-bottom: 12px; border-radius: 12px;
+  background: linear-gradient(110deg, rgba(124,58,237,.25), rgba(229,32,46,.18)); border: 1px solid rgba(124,58,237,.45);
+}
+.pass-box p { margin: 2px 0 0; color: #d4d4dc; font-size: 14px; }
+@media (max-width: 760px) {
+  .countdown span { min-width: 54px; padding: 6px; }
+  .countdown b { font-size: 20px; }
+  .pay-options .btn { width: 100%; }
+}
